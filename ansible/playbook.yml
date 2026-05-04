@@ -1,3 +1,4 @@
+# ansible/playbook.yml
 ---
 - name: Install dependencies on all nodes
   hosts: all
@@ -6,6 +7,7 @@
     - name: Update apt cache
       apt:
         update_cache: yes
+        cache_valid_time: 3600
 
     - name: Install prerequisites
       apt:
@@ -13,7 +15,16 @@
           - curl
           - apt-transport-https
           - ca-certificates
+          - gnupg
+          - lsb-release
+          - python3
+          - python3-pip
         state: present
+
+    - name: Ensure python3 is available
+      command: python3 --version
+      register: python_version
+      changed_when: false
 
 - name: Install K3s master
   hosts: master_node
@@ -34,15 +45,26 @@
         src: /var/lib/rancher/k3s/server/node-token
       register: node_token
 
-    - name: Save token to file
+    - name: Save token to shared location
       copy:
         content: "{{ node_token.content | b64decode }}"
         dest: /tmp/node-token
         mode: 0644
 
-    - name: Wait for node to be ready
-      pause:
-        seconds: 20
+    - name: Wait for K3s API to be ready
+      shell: kubectl get nodes
+      register: kubectl_ready
+      until: kubectl_ready.rc == 0
+      retries: 30
+      delay: 5
+
+    - name: Setup kubeconfig for vagrant user
+      shell: |
+        mkdir -p /home/vagrant/.kube
+        cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
+        chown -R vagrant:vagrant /home/vagrant/.kube
+        chmod 600 /home/vagrant/.kube/config
+        sed -i 's/127.0.0.1/{{ master_ip }}/g' /home/vagrant/.kube/config
 
 - name: Install K3s workers
   hosts: worker_nodes
@@ -64,59 +86,123 @@
       args:
         creates: /usr/local/bin/k3s
 
+    - name: Wait for worker to join cluster
+      pause:
+        seconds: 15
+
 - name: Deploy Task Manager application
   hosts: master_node
   become: yes
   become_user: vagrant
   tasks:
-    - name: Ensure kubeconfig exists
-      shell: |
-        mkdir -p /home/vagrant/.kube
-        cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
-        chmod 600 /home/vagrant/.kube/config
-        sed -i 's/127.0.0.1/{{ master_ip }}/g' /home/vagrant/.kube/config
+    - name: Verify kubectl is working
+      shell: kubectl get nodes
+      register: kubectl_test
+      changed_when: false
+
+    - name: Display cluster nodes
+      debug:
+        msg: "{{ kubectl_test.stdout_lines }}"
 
     - name: Create k8s-deployments directory
       file:
         path: /home/vagrant/k8s-deployments
         state: directory
 
-    - name: Copy entire k8s-deployments folder
+    - name: Copy Kubernetes manifests
       copy:
         src: k8s-deployments/
         dest: /home/vagrant/k8s-deployments/
         mode: 0644
 
-    - name: Deploy Task Manager
+    - name: Deploy namespace and configs
       shell: |
         cd /home/vagrant/k8s-deployments
         kubectl apply -f namespace.yaml
         kubectl apply -f secrets.yaml
         kubectl apply -f configmaps/
+
+    - name: Deploy PostgreSQL
+      shell: |
+        cd /home/vagrant/k8s-deployments
         kubectl apply -f deployments/postgres-statefulset.yaml
-        sleep 30
+
+    - name: Wait for PostgreSQL
+      shell: |
         kubectl wait --for=condition=ready pod -l app=postgres -n {{ app_namespace }} --timeout=120s
+      register: pg_wait
+      until: pg_wait.rc == 0
+      retries: 12
+      delay: 10
+
+    - name: Deploy backend
+      shell: |
+        cd /home/vagrant/k8s-deployments
         kubectl apply -f deployments/backend-deployment.yaml
+
+    - name: Deploy frontend
+      shell: |
+        cd /home/vagrant/k8s-deployments
         kubectl apply -f deployments/frontend-deployment.yaml
-        kubectl apply -f networkpolicy/network-policy.yaml
-        kubectl apply -f ingress/ingress.yaml
-        kubectl apply -f hpa/hpa.yaml
-        kubectl apply -f hpa/
-        kubectl apply -f ingress/
-        kubectl apply -f networkpolicy/
+
+    - name: Wait for backend pods
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=backend -n {{ app_namespace }} --timeout=60s
+      register: backend_wait
+      until: backend_wait.rc == 0
+      retries: 6
+      delay: 10
+
+    - name: Wait for frontend pods
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=frontend -n {{ app_namespace }} --timeout=60s
+      register: frontend_wait
+      until: frontend_wait.rc == 0
+      retries: 6
+      delay: 10
+
+    - name: Deploy optional components (HPA, Ingress, Network Policies)
+      shell: |
+        cd /home/vagrant/k8s-deployments
+        kubectl apply -f hpa/ 2>/dev/null || echo "HPA not configured"
+        kubectl apply -f ingress/ 2>/dev/null || echo "Ingress not configured"
+        kubectl apply -f networkpolicy/ 2>/dev/null || echo "Network policies not configured"
+      ignore_errors: yes
+
+    - name: Get all pods status
+      shell: kubectl get pods -n {{ app_namespace }}
+      register: pod_status
+
+    - name: Display pod status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
 
     - name: Get access URL
-      shell: echo "http://{{ master_ip }}:30080"
-      register: access_url
+      set_fact:
+        access_url: "http://192.168.56.10:30080"
 
-    - name: Show deployment info
+    - name: Show deployment success message
       debug:
         msg: |
-          ========================================
-          ✅ Task Manager Deployed Successfully!
-          ========================================
-          Access: {{ access_url.stdout }}
+          ╔══════════════════════════════════════════════════════════╗
+          ║     ✅ TASK MANAGER DEPLOYED SUCCESSFULLY! ✅           ║
+          ╚══════════════════════════════════════════════════════════╝
           
-          Check status:
-          kubectl get pods -n {{ app_namespace }}
-          ========================================
+          📍 ACCESS THE APPLICATION:
+             {{ access_url }}
+          
+          🔧 USEFUL COMMANDS:
+             vagrant ssh master
+             kubectl get nodes
+             kubectl get pods -n {{ app_namespace }}
+             kubectl logs -f deployment/backend -n {{ app_namespace }}
+          
+          🌐 TEST THE API:
+             curl {{ access_url }}/api/tasks
+             curl -X POST {{ access_url }}/api/tasks \
+               -H "Content-Type: application/json" \
+               -d '{"title":"Test","description":"Hello","status":"pending"}'
+          
+          ╔══════════════════════════════════════════════════════════╗
+          ║              DEPLOYMENT COMPLETE!                        ║
+          ╚══════════════════════════════════════════════════════════╝

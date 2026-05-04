@@ -1,6 +1,7 @@
 # Vagrantfile
 Vagrant.configure("2") do |config|
-  config.vm.box = "ubuntu/noble64"
+  # Use Ubuntu 22.04 (Jammy) - available on Vagrant Cloud
+  config.vm.box = "ubuntu/jammy64"
   
   # Master node
   config.vm.define "master" do |master|
