@@ -1,0 +1,122 @@
+---
+- name: Install dependencies on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+        state: present
+
+- name: Install K3s master
+  hosts: master_node
+  become: yes
+  tasks:
+    - name: Install K3s server
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        K3S_KUBECONFIG_MODE="644" \
+        INSTALL_K3S_EXEC="server --bind-address={{ master_ip }} --advertise-address={{ master_ip }}" \
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Get node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+
+    - name: Save token to file
+      copy:
+        content: "{{ node_token.content | b64decode }}"
+        dest: /tmp/node-token
+        mode: 0644
+
+    - name: Wait for node to be ready
+      pause:
+        seconds: 20
+
+- name: Install K3s workers
+  hosts: worker_nodes
+  become: yes
+  tasks:
+    - name: Get master token
+      slurp:
+        src: /tmp/node-token
+      delegate_to: master
+      register: worker_token
+
+    - name: Install K3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        K3S_URL=https://{{ master_ip }}:6443 \
+        K3S_TOKEN={{ worker_token.content | b64decode | trim }} \
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+- name: Deploy Task Manager application
+  hosts: master_node
+  become: yes
+  become_user: vagrant
+  tasks:
+    - name: Ensure kubeconfig exists
+      shell: |
+        mkdir -p /home/vagrant/.kube
+        cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
+        chmod 600 /home/vagrant/.kube/config
+        sed -i 's/127.0.0.1/{{ master_ip }}/g' /home/vagrant/.kube/config
+
+    - name: Create k8s-deployments directory
+      file:
+        path: /home/vagrant/k8s-deployments
+        state: directory
+
+    - name: Copy entire k8s-deployments folder
+      copy:
+        src: k8s-deployments/
+        dest: /home/vagrant/k8s-deployments/
+        mode: 0644
+
+    - name: Deploy Task Manager
+      shell: |
+        cd /home/vagrant/k8s-deployments
+        kubectl apply -f namespace.yaml
+        kubectl apply -f secrets.yaml
+        kubectl apply -f configmaps/
+        kubectl apply -f deployments/postgres-statefulset.yaml
+        sleep 30
+        kubectl wait --for=condition=ready pod -l app=postgres -n {{ app_namespace }} --timeout=120s
+        kubectl apply -f deployments/backend-deployment.yaml
+        kubectl apply -f deployments/frontend-deployment.yaml
+        kubectl apply -f networkpolicy/network-policy.yaml
+        kubectl apply -f ingress/ingress.yaml
+        kubectl apply -f hpa/hpa.yaml
+        kubectl apply -f hpa/
+        kubectl apply -f ingress/
+        kubectl apply -f networkpolicy/
+
+    - name: Get access URL
+      shell: echo "http://{{ master_ip }}:30080"
+      register: access_url
+
+    - name: Show deployment info
+      debug:
+        msg: |
+          ========================================
+          ✅ Task Manager Deployed Successfully!
+          ========================================
+          Access: {{ access_url.stdout }}
+          
+          Check status:
+          kubectl get pods -n {{ app_namespace }}
+          ========================================
