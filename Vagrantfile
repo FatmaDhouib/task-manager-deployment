@@ -1,7 +1,7 @@
 # Vagrantfile
 Vagrant.configure("2") do |config|
-  # Use Ubuntu 22.04 (Jammy) - available on Vagrant Cloud
   config.vm.box = "ubuntu/jammy64"
+  config.vm.boot_timeout = 600
   
   # Master node
   config.vm.define "master" do |master|
@@ -11,6 +11,7 @@ Vagrant.configure("2") do |config|
       vb.memory = "2048"
       vb.cpus = 2
     end
+    master.vm.provision "shell", path: "provision-master.sh"
   end
 
   # Worker node 1
@@ -21,6 +22,7 @@ Vagrant.configure("2") do |config|
       vb.memory = "2048"
       vb.cpus = 1
     end
+    worker1.vm.provision "shell", path: "provision-worker.sh"
   end
 
   # Worker node 2
@@ -31,13 +33,6 @@ Vagrant.configure("2") do |config|
       vb.memory = "2048"
       vb.cpus = 1
     end
-  end
-
-  # Ansible provisioning
-  config.vm.provision "ansible" do |ansible|
-    ansible.playbook = "ansible/playbook.yml"
-    ansible.inventory_path = "ansible/inventory.yml"
-    ansible.limit = "all"
-    ansible.compatibility_mode = "2.0"
+    worker2.vm.provision "shell", path: "provision-worker.sh"
   end
 end
